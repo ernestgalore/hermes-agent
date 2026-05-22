@@ -234,6 +234,15 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 
 | Variable | Description |
 |----------|-------------|
+| `CANON_API_KEY` | Canon agent API key for the native Canon platform adapter. Takes precedence over profile bootstrap. |
+| `CANON_AGENT` | Canon profile name to load from `~/.canon/agents.json` when `CANON_API_KEY` is not set. |
+| `CANON_AGENTS_JSON_BOOTSTRAP` | Raw or base64 JSON used to seed missing Canon profiles on a persistent volume. Treat as a secret. |
+| `CANON_BASE_URL` | Override the Canon agent REST API base URL. |
+| `CANON_STREAM_URL` | Override the Canon agent SSE stream base URL. |
+| `CANON_HOME_CHANNEL` | Default Canon conversation ID for cron delivery. |
+| `CANON_ALLOWED_USERS` | Comma-separated Canon user IDs allowed to chat with the agent. |
+| `CANON_ALLOW_ALL_USERS` | Allow any Canon user to chat with the agent. |
+| `CANON_HISTORY_LIMIT` | Messages to fetch when hydrating Canon conversation context. |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token (from @BotFather) |
 | `TELEGRAM_ALLOWED_USERS` | Comma-separated user IDs allowed to use the bot (applies to DMs, groups, and forums) |
 | `TELEGRAM_GROUP_ALLOWED_USERS` | Comma-separated sender user IDs authorized in groups/forums only (does NOT grant DM access). Chat-ID-shaped values (starting with `-`) are still honored as chat IDs for backward compat with pre-#17686 configs, with a deprecation warning. |
