@@ -68,6 +68,7 @@ Usage:
 
 import json
 import logging
+import threading
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -105,6 +106,8 @@ _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
 _secret_capture_callback = None
+_secret_capture_callback_unset = object()
+_secret_capture_callback_tls = threading.local()
 
 
 def load_env() -> Dict[str, str]:
@@ -146,6 +149,22 @@ _INJECTION_PATTERNS: list = [
 def set_secret_capture_callback(callback) -> None:
     global _secret_capture_callback
     _secret_capture_callback = callback
+    if callback is None:
+        if hasattr(_secret_capture_callback_tls, "callback"):
+            delattr(_secret_capture_callback_tls, "callback")
+    else:
+        _secret_capture_callback_tls.callback = callback
+
+
+def _get_secret_capture_callback():
+    callback = getattr(
+        _secret_capture_callback_tls,
+        "callback",
+        _secret_capture_callback_unset,
+    )
+    if callback is not _secret_capture_callback_unset:
+        return callback
+    return _secret_capture_callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -311,7 +330,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = _get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -329,7 +349,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
@@ -1564,4 +1584,3 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
-

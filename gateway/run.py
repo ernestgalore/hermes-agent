@@ -15241,6 +15241,108 @@ class GatewayRunner:
 
             agent.clarify_callback = _clarify_callback_sync
 
+            # Sensitive runtime input callbacks.  Canon and similar native
+            # HITL platforms can render inline cards and deliver the actual
+            # value through their ephemeral control path, keeping sudo/secret
+            # values out of transcripts and platform message logs.
+            from tools.terminal_tool import (
+                _get_sudo_password_callback as _get_previous_sudo_password_callback,
+                set_sudo_password_callback,
+            )
+            import tools.skills_tool as _skills_tool_module
+            from tools.skills_tool import set_secret_capture_callback
+
+            _previous_sudo_password_callback = _get_previous_sudo_password_callback()
+            _previous_secret_capture_callback = getattr(
+                _skills_tool_module,
+                "_get_secret_capture_callback",
+                lambda: getattr(_skills_tool_module, "_secret_capture_callback", None),
+            )()
+
+            def _native_runtime_input_sync(
+                kind: str,
+                prompt: str,
+                *,
+                title: str | None = None,
+                secret_name: str | None = None,
+                timeout_seconds: float = 600.0,
+            ) -> str:
+                import uuid as _uuid
+
+                if not _status_adapter or not getattr(type(_status_adapter), "request_runtime_input", None):
+                    return ""
+                try:
+                    _status_adapter.pause_typing_for_chat(_status_chat_id)
+                except Exception:
+                    pass
+                input_id = f"rin_{kind}_{_uuid.uuid4().hex[:12]}"
+                fut = None
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        _status_adapter.request_runtime_input(
+                            chat_id=_status_chat_id,
+                            kind=kind,
+                            prompt=prompt,
+                            input_id=input_id,
+                            session_key=session_key or "",
+                            title=title,
+                            secret_name=secret_name,
+                            timeout_seconds=timeout_seconds,
+                            metadata=_status_thread_metadata,
+                        ),
+                        _loop_for_step,
+                    )
+                    value = fut.result(timeout=float(timeout_seconds) + 20.0)
+                    return value if isinstance(value, str) else ""
+                except Exception as exc:
+                    if fut is not None:
+                        try:
+                            fut.cancel()
+                        except Exception:
+                            pass
+                    logger.warning("%s prompt failed: %s", kind, exc)
+                    return ""
+
+            def _sudo_password_callback_sync() -> str:
+                return _native_runtime_input_sync(
+                    "sudo",
+                    "Hermes needs your sudo password to continue.",
+                    title="Sudo password required",
+                    timeout_seconds=120.0,
+                )
+
+            def _secret_capture_callback_sync(env_var, prompt, metadata=None):
+                value = _native_runtime_input_sync(
+                    "secret",
+                    str(prompt or f"{env_var} is required."),
+                    title=f"{env_var} required" if env_var else "Secret required",
+                    secret_name=str(env_var or "") or None,
+                    timeout_seconds=600.0,
+                )
+                if not value:
+                    return {
+                        "success": True,
+                        "stored_as": env_var,
+                        "validated": False,
+                        "skipped": True,
+                        "message": "skipped",
+                    }
+                from hermes_cli.config import save_env_value_secure
+
+                return {
+                    **save_env_value_secure(env_var, value),
+                    "skipped": False,
+                    "message": "ok",
+                }
+
+            _has_native_runtime_input = bool(
+                _status_adapter
+                and getattr(type(_status_adapter), "request_runtime_input", None) is not None
+            )
+            if _has_native_runtime_input:
+                set_sudo_password_callback(_sudo_password_callback_sync)
+                set_secret_capture_callback(_secret_capture_callback_sync)
+
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -15512,6 +15614,9 @@ class GatewayRunner:
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                if _has_native_runtime_input:
+                    set_sudo_password_callback(_previous_sudo_password_callback)
+                    set_secret_capture_callback(_previous_secret_capture_callback)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.

@@ -140,9 +140,10 @@ class PendingApproval:
 class PendingRuntimeInput:
     conversation_id: str
     session_key: str
-    clarify_id: str
+    input_id: str
     kind: str
     created_at: float
+    clarify_id: Optional[str] = None
 
 
 class CanonHttpClient:
@@ -290,6 +291,43 @@ class CanonHttpClient:
         if status in {"typing", "thinking"}:
             body["status"] = status
         await self._request_json("POST", "/typing", json_body=body)
+
+    async def create_runtime_input_request(
+        self,
+        conversation_id: str,
+        *,
+        input_id: str,
+        kind: str,
+        expires_at: int,
+    ) -> None:
+        await self._request_json(
+            "POST",
+            "/runtime-input/request",
+            json_body={
+                "conversationId": conversation_id,
+                "inputId": input_id,
+                "kind": kind,
+                "expiresAt": expires_at,
+            },
+        )
+
+    async def consume_runtime_input_response(
+        self,
+        conversation_id: str,
+        *,
+        input_id: str,
+        cancel: bool = False,
+    ) -> dict[str, Any]:
+        data = await self._request_json(
+            "POST",
+            "/runtime-input/consume",
+            json_body={
+                "conversationId": conversation_id,
+                "inputId": input_id,
+                **({"cancel": True} if cancel else {}),
+            },
+        )
+        return data if isinstance(data, dict) else {}
 
     async def stream_events(
         self,
@@ -664,7 +702,26 @@ class CanonAdapter(BasePlatformAdapter):
         """Render a Canon runtime input card for Hermes clarify prompts."""
         input_id = f"rin_{clarify_id}"
         normalized_choices = _runtime_input_choices(choices)
-        expires_at = _iso_after(DEFAULT_RUNTIME_INPUT_TIMEOUT_SECONDS)
+        expires_at_ms = _ms_after(DEFAULT_RUNTIME_INPUT_TIMEOUT_SECONDS)
+        expires_at = _iso_from_ms(expires_at_ms)
+        client = self._client or self._make_client()
+        owns_client = self._client is None
+        try:
+            await client.create_runtime_input_request(
+                str(chat_id),
+                input_id=input_id,
+                kind="clarify",
+                expires_at=expires_at_ms,
+            )
+        except Exception as exc:
+            if owns_client:
+                await client.close()
+            return SendResult(
+                success=False,
+                error=_safe_error(exc),
+                retryable=_is_retryable(exc),
+            )
+
         request_metadata = {
             "type": "runtime_input_request",
             "inputId": input_id,
@@ -701,16 +758,149 @@ class CanonAdapter(BasePlatformAdapter):
             "Input required",
             metadata=request_metadata,
             parent_metadata=metadata,
+            client=client,
         )
+        if not result.success:
+            try:
+                await client.consume_runtime_input_response(
+                    str(chat_id),
+                    input_id=input_id,
+                    cancel=True,
+                )
+            except Exception:
+                pass
+        if owns_client:
+            await client.close()
         if result.success:
             self._pending_runtime_inputs[input_id] = PendingRuntimeInput(
                 conversation_id=str(chat_id),
                 session_key=session_key,
+                input_id=input_id,
                 clarify_id=clarify_id,
                 kind="clarify",
                 created_at=time.monotonic(),
             )
         return result
+
+    async def request_runtime_input(
+        self,
+        chat_id: str,
+        *,
+        kind: str,
+        prompt: str,
+        input_id: str,
+        session_key: str,
+        title: Optional[str] = None,
+        choices: Optional[list] = None,
+        secret_name: Optional[str] = None,
+        timeout_seconds: float = DEFAULT_RUNTIME_INPUT_TIMEOUT_SECONDS,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Render a Canon runtime input card and wait for the owner response."""
+        if kind not in {"clarify", "sudo", "secret"}:
+            return None
+        client = self._client or self._make_client()
+        owns_client = self._client is None
+        status = "timeout"
+        pending = PendingRuntimeInput(
+            conversation_id=str(chat_id),
+            session_key=session_key,
+            input_id=input_id,
+            kind=kind,
+            created_at=time.monotonic(),
+        )
+
+        try:
+            expires_at_ms = _ms_after(timeout_seconds)
+            expires_at = _iso_from_ms(expires_at_ms)
+            await client.create_runtime_input_request(
+                str(chat_id),
+                input_id=input_id,
+                kind=kind,
+                expires_at=expires_at_ms,
+            )
+
+            request_metadata: dict[str, Any] = {
+                "type": "runtime_input_request",
+                "inputId": input_id,
+                "kind": kind,
+                "prompt": _redact_text(prompt)[:1000] if kind == "clarify" else prompt[:1000],
+                "title": title or _runtime_input_title(kind, secret_name),
+                "native": {
+                    "runtime": "hermes",
+                    "method": f"{kind}.request",
+                    "requestId": input_id,
+                    "sessionKey": session_key,
+                    "handles": {
+                        "inputId": input_id,
+                        "sessionKey": session_key,
+                    },
+                },
+                "expiresAt": expires_at,
+            }
+            normalized_choices = _runtime_input_choices(choices)
+            if normalized_choices:
+                request_metadata["choices"] = normalized_choices
+            if secret_name:
+                request_metadata["secretName"] = secret_name
+            if kind in {"sudo", "secret"}:
+                request_metadata["sensitive"] = True
+
+            result = await self._send_control_message(
+                chat_id,
+                "Input required",
+                metadata=request_metadata,
+                parent_metadata=metadata,
+                client=client,
+            )
+            if not result.success:
+                await client.consume_runtime_input_response(
+                    str(chat_id), input_id=input_id, cancel=True
+                )
+                status = "cancelled"
+                return None
+
+            self._pending_runtime_inputs[input_id] = pending
+            deadline = time.monotonic() + max(1.0, float(timeout_seconds))
+            while time.monotonic() < deadline:
+                response = await client.consume_runtime_input_response(
+                    str(chat_id), input_id=input_id
+                )
+                response_status = response.get("status")
+                if response_status == "submitted":
+                    status = "submitted"
+                    value = response.get("value")
+                    return value if isinstance(value, str) else ""
+                if response_status in {"cancelled", "timeout"}:
+                    status = str(response_status)
+                    return None
+                await asyncio.sleep(1.0)
+
+            try:
+                await client.consume_runtime_input_response(str(chat_id), input_id=input_id)
+            except Exception:
+                pass
+            return None
+        except asyncio.CancelledError:
+            try:
+                await client.consume_runtime_input_response(
+                    str(chat_id), input_id=input_id, cancel=True
+                )
+            except Exception:
+                pass
+            status = "cancelled"
+            raise
+        except Exception:
+            logger.debug("Canon runtime input request failed", exc_info=True)
+            return None
+        finally:
+            self._pending_runtime_inputs.pop(input_id, None)
+            try:
+                await self._send_runtime_input_outcome(input_id, pending, status)
+            except Exception:
+                pass
+            if owns_client:
+                await client.close()
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         convo = self._conversation_cache.get(str(chat_id))
@@ -730,19 +920,20 @@ class CanonAdapter(BasePlatformAdapter):
         *,
         metadata: dict[str, Any],
         parent_metadata: Optional[Dict[str, Any]] = None,
+        client: Optional[CanonHttpClient] = None,
     ) -> SendResult:
         if not self.api_key:
             return SendResult(
                 success=False, error="Canon API key is not configured", retryable=False
             )
 
-        client = self._client or self._make_client()
-        owns_client = self._client is None
+        active_client = client or self._client or self._make_client()
+        owns_client = client is None and self._client is None
         try:
             canon_options, extra_metadata = _split_canon_metadata(parent_metadata)
             message_metadata = {**extra_metadata, **metadata}
             canon_options.setdefault("contentType", "text")
-            data = await client.send_message(
+            data = await active_client.send_message(
                 str(chat_id),
                 text,
                 metadata=message_metadata,
@@ -763,7 +954,7 @@ class CanonAdapter(BasePlatformAdapter):
             )
         finally:
             if owns_client:
-                await client.close()
+                await active_client.close()
 
     def _make_client(self) -> CanonHttpClient:
         return CanonHttpClient(
@@ -1107,6 +1298,8 @@ class CanonAdapter(BasePlatformAdapter):
 
         if pending.kind != "clarify":
             return
+        if not pending.clarify_id:
+            return
 
         answer = ""
         if status == "submitted":
@@ -1124,6 +1317,14 @@ class CanonAdapter(BasePlatformAdapter):
             resolved = False
 
         if resolved:
+            if self._client is not None:
+                try:
+                    await self._client.consume_runtime_input_response(
+                        conversation_id,
+                        input_id=input_id,
+                    )
+                except Exception:
+                    logger.debug("Failed to consume Canon clarify value", exc_info=True)
             self._pending_runtime_inputs.pop(input_id, None)
             await self._send_runtime_input_outcome(input_id, pending, status)
 
@@ -1636,6 +1837,25 @@ def _iso_after(seconds: int) -> str:
     return (
         datetime.now(timezone.utc) + timedelta(seconds=seconds)
     ).isoformat().replace("+00:00", "Z")
+
+
+def _ms_after(seconds: float) -> int:
+    return int((time.time() + max(1.0, float(seconds))) * 1000)
+
+
+def _iso_from_ms(milliseconds: int) -> str:
+    return datetime.fromtimestamp(
+        milliseconds / 1000.0,
+        tz=timezone.utc,
+    ).isoformat().replace("+00:00", "Z")
+
+
+def _runtime_input_title(kind: str, secret_name: Optional[str] = None) -> str:
+    if kind == "sudo":
+        return "Sudo password required"
+    if kind == "secret":
+        return f"{secret_name} required" if secret_name else "Secret required"
+    return "Input required"
 
 
 def _approval_request_text(

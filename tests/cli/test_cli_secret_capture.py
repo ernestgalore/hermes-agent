@@ -145,3 +145,28 @@ def test_cli_chat_registers_secret_capture_callback():
         assert skills_tool_module._secret_capture_callback == cli_obj._secret_capture_callback
     finally:
         set_secret_capture_callback(None)
+
+
+def test_secret_capture_callback_is_thread_local():
+    def main_cb():
+        return None
+
+    def worker_cb():
+        return None
+
+    seen = []
+    try:
+        set_secret_capture_callback(main_cb)
+
+        def worker():
+            set_secret_capture_callback(worker_cb)
+            seen.append(skills_tool_module._get_secret_capture_callback())
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=2)
+
+        assert seen == [worker_cb]
+        assert skills_tool_module._get_secret_capture_callback() is main_cb
+    finally:
+        set_secret_capture_callback(None)

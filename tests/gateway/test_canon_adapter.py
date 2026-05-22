@@ -368,6 +368,9 @@ class TestCanonOutbound:
             self.sent = []
             self.typing = []
             self.uploads = []
+            self.runtime_requests = []
+            self.runtime_responses = []
+            self.runtime_consumes = []
             self.closed = False
 
         async def send_message(
@@ -399,6 +402,30 @@ class TestCanonOutbound:
                     "fileName": file_name,
                 },
             }
+
+        async def create_runtime_input_request(
+            self, conversation_id, *, input_id, kind, expires_at
+        ):
+            self.runtime_requests.append({
+                "conversation_id": conversation_id,
+                "input_id": input_id,
+                "kind": kind,
+                "expires_at": expires_at,
+            })
+
+        async def consume_runtime_input_response(
+            self, conversation_id, *, input_id, cancel=False
+        ):
+            self.runtime_consumes.append({
+                "conversation_id": conversation_id,
+                "input_id": input_id,
+                "cancel": cancel,
+            })
+            if cancel:
+                return {"status": "cancelled", "inputId": input_id, "kind": "secret"}
+            if self.runtime_responses:
+                return self.runtime_responses.pop(0)
+            return {"status": "pending", "inputId": input_id}
 
         async def close(self):
             self.closed = True
@@ -598,6 +625,9 @@ class TestCanonOutbound:
 
         assert result.success is True
         assert marked == ["clarify-1"]
+        assert fake.runtime_requests[0]["conversation_id"] == "convo-1"
+        assert fake.runtime_requests[0]["input_id"] == "rin_clarify-1"
+        assert fake.runtime_requests[0]["kind"] == "clarify"
         request = fake.sent[0]["metadata"]
         assert request["type"] == "runtime_input_request"
         assert request["kind"] == "clarify"
@@ -624,6 +654,44 @@ class TestCanonOutbound:
         })
 
         assert resolved == {"clarify_id": "clarify-1", "response": "Savings"}
+        assert fake.runtime_consumes[-1] == {
+            "conversation_id": "convo-1",
+            "input_id": request["inputId"],
+            "cancel": False,
+        }
+        assert fake.sent[1]["metadata"]["type"] == "runtime_input_outcome"
+        assert fake.sent[1]["metadata"]["status"] == "submitted"
+
+    @pytest.mark.asyncio
+    async def test_request_runtime_input_returns_secret_value_without_message_leak(self):
+        adapter = CanonAdapter(_config(extra={"api_key": "key"}))
+        fake = self.FakeClient()
+        fake.runtime_responses.append({
+            "status": "submitted",
+            "inputId": "rin-secret-1",
+            "kind": "secret",
+            "value": "super-secret",
+        })
+        adapter._client = fake
+
+        value = await adapter.request_runtime_input(
+            "convo-1",
+            kind="secret",
+            prompt="Paste the token",
+            input_id="rin-secret-1",
+            session_key="session-1",
+            secret_name="API_TOKEN",
+            timeout_seconds=5,
+        )
+
+        assert value == "super-secret"
+        assert fake.runtime_requests[0]["kind"] == "secret"
+        request = fake.sent[0]["metadata"]
+        assert request["type"] == "runtime_input_request"
+        assert request["kind"] == "secret"
+        assert request["sensitive"] is True
+        assert request["secretName"] == "API_TOKEN"
+        assert "super-secret" not in json.dumps(fake.sent)
         assert fake.sent[1]["metadata"]["type"] == "runtime_input_outcome"
         assert fake.sent[1]["metadata"]["status"] == "submitted"
 
