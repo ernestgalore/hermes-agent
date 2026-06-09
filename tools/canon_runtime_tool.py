@@ -12,11 +12,24 @@ import os
 import time
 from typing import Any, Optional
 
+import httpx
+
 from tools.registry import registry, tool_error, tool_result
 
 
 DEFAULT_TIMEOUT_SECONDS = 300
 POLL_SECONDS = 1.0
+
+
+def _is_transient_poll_error(exc: Exception) -> bool:
+    """A single consume() failure during the human-review poll must not abort the
+    whole review if it is transient (5xx / timeout / network blip on the shared
+    backend). CanonApiError carries `.retryable`; httpx transport/timeout errors
+    are transient. Genuine 4xx (e.g. 403/404 — card gone) are not, and re-raise."""
+    retryable = getattr(exc, "retryable", None)
+    if isinstance(retryable, bool):
+        return retryable
+    return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
 
 
 def _safe_timeout_seconds(value: Any, default: int = DEFAULT_TIMEOUT_SECONDS) -> int:
@@ -136,16 +149,34 @@ async def request_canon_runtime_card(
             raise RuntimeError("Canon runtime-card request did not return a card id")
 
         while time.time() * 1000 <= expires_at:
-            response = await client.consume_runtime_card_response(
-                conversation_id,
-                effective_card_id,
-            )
+            try:
+                response = await client.consume_runtime_card_response(
+                    conversation_id,
+                    effective_card_id,
+                )
+            except Exception as exc:
+                if not _is_transient_poll_error(exc):
+                    raise
+                await asyncio.sleep(POLL_SECONDS)
+                continue
             status = response.get("status")
             if status and status != "pending":
                 response.setdefault("conversationId", conversation_id)
                 return response
             await asyncio.sleep(POLL_SECONDS)
 
+        # Local deadline reached. Do a final read FIRST — the server resolves a
+        # response that raced the deadline (response-over-expiry), so honor a real
+        # submission instead of discarding it as a timeout; otherwise cancel to
+        # clean up the pending card.
+        try:
+            final = await client.consume_runtime_card_response(conversation_id, effective_card_id)
+            status = final.get("status")
+            if status and status not in ("pending", "timeout"):
+                final.setdefault("conversationId", conversation_id)
+                return final
+        except Exception:
+            pass
         try:
             await client.consume_runtime_card_response(
                 conversation_id,
@@ -199,16 +230,33 @@ async def request_canon_runtime_input(
         )
 
         while time.time() * 1000 <= expires_at:
-            response = await client.consume_runtime_input_response(
-                conversation_id,
-                input_id,
-            )
+            try:
+                response = await client.consume_runtime_input_response(
+                    conversation_id,
+                    input_id,
+                )
+            except Exception as exc:
+                if not _is_transient_poll_error(exc):
+                    raise
+                await asyncio.sleep(POLL_SECONDS)
+                continue
             status = response.get("status")
             if status and status != "pending":
                 response.setdefault("conversationId", conversation_id)
                 return response
             await asyncio.sleep(POLL_SECONDS)
 
+        # Local deadline reached. Final read first so a response that raced the
+        # deadline is honored (response-over-expiry) instead of being discarded;
+        # otherwise cancel to clean up.
+        try:
+            final = await client.consume_runtime_input_response(conversation_id, input_id)
+            status = final.get("status")
+            if status and status not in ("pending", "timeout"):
+                final.setdefault("conversationId", conversation_id)
+                return final
+        except Exception:
+            pass
         try:
             await client.consume_runtime_input_response(
                 conversation_id,

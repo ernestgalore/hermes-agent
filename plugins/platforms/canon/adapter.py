@@ -20,6 +20,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import time
 import uuid
 from collections import deque
@@ -611,6 +612,12 @@ class CanonAdapter(BasePlatformAdapter):
         self._runtime_signal_task: Optional[asyncio.Task] = None
         self._stream_stop: Optional[asyncio.Event] = None
         self._last_event_id: Optional[str] = None
+        # High-water mark (epoch ms) of the newest inbound message observed, used
+        # to bound the reconnect backfill so it never replays pre-connect history.
+        self._last_message_ms: int = 0
+        # False until the stream has connected at least once; gates the backfill
+        # so the very first connect relies on the live stream (no history replay).
+        self._stream_connected_once: bool = False
         self._conversation_cache: dict[str, dict[str, Any]] = {}
         self._seen_message_ids: set[str] = set()
         self._seen_message_order: Deque[str] = deque()
@@ -643,6 +650,10 @@ class CanonAdapter(BasePlatformAdapter):
                 self.profile_agent_name = agent_display_name
                 os.environ["HERMES_CANON_AGENT_NAME"] = agent_display_name
             await self._refresh_conversations()
+            # Baseline the high-water mark at connect time so the reconnect
+            # backfill only ever picks up messages newer than this point — the
+            # live stream handles forward delivery and we never replay history.
+            self._last_message_ms = int(time.time() * 1000)
             self._mark_connected()
             await self._publish_runtime_status()
             self._runtime_status_task = asyncio.create_task(
@@ -1617,24 +1628,113 @@ class CanonAdapter(BasePlatformAdapter):
         backoff = 1.0
 
         while self._stream_stop is not None and not self._stream_stop.is_set():
+            # On a reconnect (not the very first connect), catch up on messages
+            # that arrived while the stream was down. The per-instance SSE replay
+            # buffer does not survive an instance recycle or an expired window,
+            # so without this, inbound messages in the gap are silently lost.
+            if self._stream_connected_once:
+                try:
+                    await self._backfill_missed_messages()
+                except Exception as exc:
+                    logger.debug("Canon backfill failed: %s", _safe_error(exc))
             try:
+                self._stream_connected_once = True
                 async for frame in self._client.stream_events(
                     last_event_id=self._last_event_id
                 ):
+                    # A delivered frame proves the connection is healthy — reset
+                    # backoff so the NEXT drop reconnects fast instead of pinning
+                    # at the 30s ceiling after a run of infra-driven disconnects.
+                    backoff = 1.0
                     if frame.event_id:
                         self._last_event_id = frame.event_id
                     await self._handle_stream_frame(frame)
-                backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if self._stream_stop is not None and self._stream_stop.is_set():
                     break
+                # Non-retryable errors (e.g. 401/403 after an API-key rotation)
+                # will never recover by retrying — go fatal so the supervisor
+                # sees a disconnected/failed status instead of a silent hot loop.
+                if isinstance(exc, CanonApiError) and not exc.retryable:
+                    logger.error(
+                        "Canon stream fatal (HTTP %s) — stopping reconnect: %s",
+                        exc.status_code,
+                        _safe_error(exc),
+                    )
+                    self._set_fatal_error("stream_failed", _safe_error(exc), retryable=False)
+                    self._mark_disconnected()
+                    break
                 logger.warning("Canon stream disconnected: %s", _safe_error(exc))
-                await asyncio.sleep(backoff)
+                # Jittered backoff to avoid a thundering-herd reconnect across the
+                # many agents sharing the stream service after a recycle.
+                jitter = random.uniform(0.0, min(backoff, 5.0) * 0.5)
+                await asyncio.sleep(backoff + jitter)
                 backoff = min(backoff * 2, 30.0)
 
+    async def _backfill_missed_messages(self) -> None:
+        """Re-fetch recent messages per conversation over REST and feed any that
+        arrived after the last observed message (the disconnect gap) through the
+        normal handler. Deduped by id and bounded by the high-water mark so it
+        never reprocesses history."""
+        client = self._client
+        if client is None:
+            return
+        since_ms = self._last_message_ms
+        try:
+            await self._refresh_conversations()
+        except Exception as exc:
+            logger.debug("Canon backfill: refresh conversations failed: %s", _safe_error(exc))
+        backfilled = 0
+        for conversation_id in list(self._conversation_cache.keys()):
+            try:
+                messages = await client.get_messages(conversation_id, limit=self.history_limit)
+            except Exception as exc:
+                logger.debug(
+                    "Canon backfill: get_messages(%s) failed: %s",
+                    conversation_id,
+                    _safe_error(exc),
+                )
+                continue
+            # REST returns newest-first; replay oldest-first to preserve order.
+            ordered = sorted(
+                (m for m in messages if isinstance(m, dict)),
+                key=lambda m: _message_created_ms(m) or 0,
+            )
+            for message in ordered:
+                ms = _message_created_ms(message)
+                # Conservative: only replay messages strictly newer than the gap
+                # boundary. Unparseable timestamps are treated as already-observed
+                # so we never accidentally replay pre-connect history as new turns.
+                if ms is None or ms <= since_ms:
+                    continue
+                message_id = _first_string(message, "id")
+                if message_id and message_id in self._seen_message_ids:
+                    continue
+                await self._handle_message_payload(
+                    {"conversationId": conversation_id, "message": message}
+                )
+                backfilled += 1
+        if backfilled:
+            logger.info(
+                "Canon backfill recovered %d missed message(s) after reconnect",
+                backfilled,
+            )
+
     async def _handle_stream_frame(self, frame: CanonStreamFrame) -> None:
+        if frame.event == "replay.expired":
+            # The server's replay buffer no longer covers our Last-Event-ID
+            # (instance recycle / window exceeded). Catch up over REST instead of
+            # silently losing the gap.
+            logger.info("Canon replay window expired — backfilling missed messages via REST")
+            await self._backfill_missed_messages()
+            return
+        if frame.event == "error":
+            # Server-sent control error (connection_reclaimed/stale/limit, etc.).
+            # Surface it rather than treating the disconnect as anonymous.
+            logger.warning("Canon stream error event: %s", frame.data)
+            return
         if frame.event == "agent.context" and isinstance(frame.data, dict):
             self._agent_id = (
                 _first_string(frame.data, "agentId", "id", "userId") or self._agent_id
@@ -1673,6 +1773,12 @@ class CanonAdapter(BasePlatformAdapter):
         message = payload.get("message")
         if not isinstance(message, dict):
             return
+
+        # Advance the inbound high-water mark for every observed message (any
+        # sender) so the reconnect backfill knows where the gap begins.
+        created_ms = _message_created_ms(message)
+        if created_ms is not None and created_ms > self._last_message_ms:
+            self._last_message_ms = created_ms
 
         sender_id = _first_string(message, "senderId")
         if self._agent_id and sender_id == self._agent_id:
@@ -1771,14 +1877,19 @@ class CanonAdapter(BasePlatformAdapter):
 
         return media_urls, media_types, message_type
 
-    def _already_seen(self, message_id: str) -> bool:
+    def _remember_seen(self, message_id: str) -> None:
         if message_id in self._seen_message_ids:
-            return True
+            return
         self._seen_message_ids.add(message_id)
         self._seen_message_order.append(message_id)
         while len(self._seen_message_order) > MAX_SEEN_MESSAGE_IDS:
             old = self._seen_message_order.popleft()
             self._seen_message_ids.discard(old)
+
+    def _already_seen(self, message_id: str) -> bool:
+        if message_id in self._seen_message_ids:
+            return True
+        self._remember_seen(message_id)
         return False
 
 
@@ -2680,6 +2791,42 @@ def _is_canon_control_message(message: dict[str, Any]) -> bool:
     if not isinstance(metadata, dict):
         return False
     return metadata.get("type") in CONTROL_METADATA_TYPES
+
+
+def _message_created_ms(message: dict[str, Any]) -> Optional[int]:
+    """Best-effort epoch-ms for a Canon message's createdAt, across the formats
+    the REST/stream serializers may emit. Returns None when unparseable so the
+    caller can fall back conservatively (never replay history)."""
+    raw = message.get("createdAt")
+    if raw is None:
+        raw = message.get("timestamp")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+        # Heuristic: < ~1e12 is seconds, otherwise milliseconds.
+        return int(value * 1000) if value < 1_000_000_000_000 else int(value)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return _message_created_ms({"createdAt": int(text)})
+        try:
+            from datetime import datetime
+            return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            return None
+    if isinstance(raw, dict):
+        for key in ("_milliseconds", "milliseconds"):
+            if isinstance(raw.get(key), (int, float)):
+                return int(raw[key])
+        for key in ("_seconds", "seconds"):
+            if isinstance(raw.get(key), (int, float)):
+                nanos = raw.get("_nanoseconds") or raw.get("nanoseconds") or 0
+                nanos = nanos if isinstance(nanos, (int, float)) else 0
+                return int(raw[key] * 1000 + nanos / 1_000_000)
+    return None
 
 
 def _safe_error(exc: Exception) -> str:
